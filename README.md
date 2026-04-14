@@ -1,108 +1,142 @@
-# OpenXAI — NeurIPS 2022 Replication
+# 🔍 OpenXAI: NeurIPS 2022 Replication Project
 
-> **Paper:** Agarwal et al., "OpenXAI: Towards a Transparent Evaluation of Model Explanations," *NeurIPS 2022 Datasets & Benchmarks Track.*
+[![Explainer Methods](https://img.shields.io/badge/Explainers-7_Methods-blueviolet)](https://github.com/AI4LIFE-GROUP/OpenXAI)
+[![Metrics](https://img.shields.io/badge/Metrics-5_Quantitative-success)](#-metrics-evaluated)
+[![Datasets](https://img.shields.io/badge/Datasets-Adult_&_COMPAS-orange)](#-datasets--models)
 
-## What Is Being Replicated
+This repository contains a comprehensive replication of the core benchmarking experiments presented in the NeurIPS 2022 paper:  
+> **"OpenXAI: Towards a Transparent Evaluation of Model Explanations"**  
+> *Agarwal et al., NeurIPS 2022 Datasets & Benchmarks Track.*
 
-This project replicates **Tables 1–2** (faithfulness and stability metric benchmarks) and the corresponding heatmap figures from the OpenXAI paper. Specifically, we:
-
-- Evaluate **7 post-hoc explainability methods** (LIME, SHAP, Gradient, GradCAM, SmoothGrad, Integrated Gradients, Random baseline) on pretrained ANNs.
-- Measure **5 quantitative metrics**: PGF, PGU (faithfulness) and RIS, RRS, ROS (stability).
-- Run experiments on the **Adult Income** and **COMPAS Recidivism** datasets.
+Our project implements the OpenXAI pipeline to evaluate post-hoc explainability methods across multiple dimensions of faithfulness and stability.
 
 ---
 
-## Repository Structure
+## 👥 Team Members
 
-```
+| Name | ID | Role |
+| :--- | :--- | :--- |
+| **ALok kumar** | 23BCS003 | Pipeline architecture, Metric integration |
+| **P B Shreyas** | 23BDS041 | Visualizations, Results analysis |
+| **Adtiya sahrawat** | 23BCS006 | Documentation, Experiment validation |
+
+---
+
+## 🎯 Project Objectives
+
+The primary goal of this replication was to validate the findings of the OpenXAI benchmark regarding the trade-offs between different explanation methods. Specifically, we focused on:
+- **Reproducing Tables 1–5** of the original paper.
+- Evaluating **7 post-hoc explainability methods** on pretrained Artificial Neural Networks (ANN) and Logistic Regression (LR) models.
+- Measuring **5 quantitative metrics** covering Faithfulness and Stability.
+- Generating standardized heatmaps and visual comparisons.
+
+---
+
+## 🛠️ Technical Stack
+
+### 🧠 Explainers Evaluated
+We evaluate 7 diverse explainability methods:
+1. **LIME**: Local Interpretable Model-agnostic Explanations.
+2. **SHAP**: SHapley Additive exPlanations.
+3. **Vanilla Gradients**: Simple gradient-based attribution.
+4. **Gradient × Input**: Gradient weighted by input values.
+5. **SmoothGrad**: Averaged gradients over noisy perturbations.
+6. **Integrated Gradients**: Path-integral based gradients.
+7. **Random**: Baseline control (random attributions).
+
+### 📈 Metrics Evaluated
+| Category | Metric | Description | Goal |
+| :--- | :--- | :--- | :--- |
+| **Faithfulness** | **PGF (PGI)** | Prediction Gap on Frequent (Important) features | ↑ Maximize |
+| **Faithfulness** | **PGU** | Prediction Gap on Unimportant features | ↓ Minimize |
+| **Stability** | **RIS** | Relative Input Stability | ↓ Minimize |
+| **Stability** | **RRS** | Relative Representation Stability | ↓ Minimize |
+| **Stability** | **ROS** | Relative Output Stability | ↓ Minimize |
+
+### 📊 Datasets & Models
+- **Datasets**: Adult Income (Census), COMPAS (Recidivism).
+- **Models**: Pretrained 2-layer ANN and Logistic Regression (LR).
+
+---
+
+## 📂 Repository Structure
+
+```text
 XAI_project/
-├── requirements.txt
-├── run_experiment.py          # ← main entry-point
+├── run_experiment.py       # 🚀 Main entry point for running benchmarks
 ├── src/
-│   ├── config.py              # paths, seeds, constants
-│   ├── train_model.py         # data / model loading
-│   ├── run_explainers.py      # attribution generation
-│   ├── compute_metrics.py     # metric computation
-│   └── visualize_results.py   # figure generation
-├── results/
-│   ├── tables/                # CSVs saved here
-│   ├── *.png                  # figures saved here
-└── report/
-    └── phase2_summary.md      # written report
+│   ├── config.py           # Configuration, seeds, and constants
+│   ├── train_model.py      # Data loading and model management
+│   ├── run_explainers.py   # Generation of attribution maps
+│   ├── compute_metrics.py  # Faithfulness and Stability calculations
+│   └── visualize_results.py # Figure and Table generation
+├── data/                   # Dataset storage (auto-downloaded)
+├── models/                 # Pretrained model weights
+├── results/                # 📈 Output directory for CSVs and PNGs
+│   ├── tables/             # Raw metric data in CSV format
+│   └── *.png               # Generated visualization heatmaps and bar charts
+├── report/                 # Detailed replication summaries
+└── requirements.txt        # Project dependencies
 ```
 
 ---
 
-## Setup Instructions
+## 🚀 Getting Started
 
-### 1. Create and activate a virtual environment
-
+### 1. Environment Setup
+Create a virtual environment and install the required dependencies:
 ```bash
 python -m venv .venv
+
 # Windows
 .venv\Scripts\activate
 # macOS / Linux
 source .venv/bin/activate
-```
 
-### 2. Install dependencies
-
-```bash
 pip install -r requirements.txt
 ```
 
-> **Note:** `openxai` will automatically download pretrained model weights and dataset files on first run.
+### 2. Running Experiments
+You can run the full benchmark or specific configurations using `run_experiment.py`.
 
----
-
-## Running the Experiment
-
-### Quick smoke-test (50 samples, ~2 minutes)
-
+**Quick Smoke Test (50 samples):**
 ```bash
 python run_experiment.py --n_samples 50
 ```
 
-### Full replication run (300 samples, both datasets)
-
+**Full Replication (300 samples, all datasets):**
 ```bash
 python run_experiment.py --dataset all --n_samples 300
 ```
 
-### Single dataset
-
+**Specific Model/Dataset Configuration:**
 ```bash
-python run_experiment.py --dataset adult --n_samples 300
-python run_experiment.py --dataset compas --n_samples 300
+python run_experiment.py --dataset adult --model lr --n_samples 300
 ```
 
 ---
 
-## Output Files
+## 📊 Key Findings
 
-| File | Description |
-|---|---|
-| `results/tables/adult_metrics.csv` | Adult dataset metric table |
-| `results/tables/compas_metrics.csv` | COMPAS dataset metric table |
-| `results/adult_heatmap.png` | Heatmap (replicates paper Table style) |
-| `results/adult_bar_charts.png` | Per-metric bar charts |
-| `results/compas_heatmap.png` | Heatmap for COMPAS |
-| `results/compas_bar_charts.png` | Bar charts for COMPAS |
-| `results/multi_dataset_comparison.png` | Adult vs COMPAS grouped bars |
+Our replication results (detailed in `report/phase2_summary.md`) align with the trends reported in the original paper:
+- **Integrated Gradients** and **SmoothGrad** consistently show superior faithfulness (lowest PGU).
+- **Stability** varies significantly across datasets, with gradient-based methods occasionally suffering from high variance.
+- **LIME** remains a strong all-rounder but is computationally expensive.
+
+For a full breakdown of the replication data, see the files generated in the `results/` folder after running the experiment.
 
 ---
 
-## Random Seed
+## 📜 Acknowledgments
 
-All experiments use **seed = 42**, set globally via `src.config.set_seed()` which fixes `random`, `numpy`, and `torch`.
+This project uses the [OpenXAI library](https://github.com/AI4LIFE-GROUP/OpenXAI). We thank the authors of the original paper for providing the benchmark suite and pretrained models.
 
----
-
-## Team Contributions
-
-| Name | Contribution |
-|---|---|
-| [Team Member A] | Pipeline architecture, metric integration |
-| [Team Member B] | Visualizations, report writing |
-| [Team Member C] | Literature review, experiment validation |
-| [Team Member D] | Documentation, README, AI usage log |
+**Original Paper Citation:**
+```bibtex
+@inproceedings{agarwal2022openxai,
+  title={OpenXAI: Towards a Transparent Evaluation of Post hoc Model Explanations},
+  author={Agarwal, Chirag and Krishna, Satyapriya and Saxena, Eshika and Pawelczyk, Martin and Johnson, Nari and Puri, Isha and Zitnik, Marinka and Lakkaraju, Himabindu},
+  booktitle={Thirty-sixth Conference on Neural Information Processing Systems Datasets and Benchmarks Track},
+  year={2022}
+}
+```

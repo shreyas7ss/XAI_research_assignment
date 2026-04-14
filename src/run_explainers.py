@@ -1,12 +1,21 @@
 """
-run_explainers.py — Generates feature-attribution explanations for a batch of
-test samples using all 7 explainers supported by OpenXAI.
+run_explainers.py — Generates feature-attribution explanations using the real
+openxai 0.1 Explainer API.
 
-Responsibilities
-----------------
-* Iterate over every explainer name defined in config.EXPLAINERS.
-* Wrap each call in try/except so a failing explainer is skipped gracefully.
-* Return a dict mapping explainer name → attribution tensor.
+Real API (openxai 0.1)
+-----------------------
+  from openxai import Explainer
+  explainer = Explainer(method, model, param_dict={})
+
+  Available methods: 'lime', 'shap', 'grad', 'sg', 'itg', 'ig', 'control'
+  (Note: 'gradcam' is NOT in this version; 'random' baseline is called 'control')
+
+  For LIME: param_dict must contain 'data' (FloatTensor of training data)
+  For IG:   param_dict must contain 'baseline' (mean of training data, shape (1, d))
+  Other methods: empty param_dict is fine
+
+  Calling explanations:
+    explainer.get_explanations(X, label=predicted_label)
 """
 
 from __future__ import annotations
@@ -17,43 +26,72 @@ from typing import Dict, Optional
 import torch
 import numpy as np
 
-import openxai
 from openxai import Explainer
+import openxai.experiment_utils as utils
 
-from src.config import EXPLAINER_PARAM_DICTS, EXPLAINERS, set_seed, RANDOM_SEED
+from src.config import RANDOM_SEED, set_seed
+
+
+# Correct method keys for openxai 0.1
+EXPLAINER_METHODS: list[str] = ["lime", "shap", "grad", "sg", "itg", "ig", "control"]
+# Human-readable display names
+EXPLAINER_DISPLAY: dict[str, str] = {
+    "lime": "lime", "shap": "shap", "grad": "grad",
+    "sg": "sg", "itg": "itg", "ig": "ig", "control": "random",
+}
+
+
+def _build_param_dict(method: str, X_train: torch.FloatTensor) -> dict:
+    """Build the correct ``param_dict`` for each explainer method.
+
+    Parameters
+    ----------
+    method : str
+        The explainer method key.
+    X_train : torch.FloatTensor
+        Full training data tensor, used as background/reference.
+
+    Returns
+    -------
+    param_dict : dict
+        Ready-to-pass parameter dictionary.
+    """
+    param_dict: dict = {}
+    if method == "lime":
+        param_dict = utils.fill_param_dict("lime", {"n_samples": 100}, X_train)
+    elif method == "ig":
+        param_dict = utils.fill_param_dict("ig", {}, X_train)
+    elif method == "shap":
+        param_dict = {"n_samples": 100}
+    return param_dict
 
 
 def _build_explainer(
     method: str,
     model: torch.nn.Module,
-    dataset_tensor: torch.Tensor,
-) -> Optional[Explainer]:
-    """Instantiate a single OpenXAI Explainer.
+    X_train: torch.FloatTensor,
+) -> Optional[object]:
+    """Instantiate a single OpenXAI Explainer with graceful error handling.
 
     Parameters
     ----------
     method : str
-        Explainer identifier (e.g. ``'lime'``, ``'shap'``, ``'grad'``).
+        Explainer key (e.g. ``'lime'``, ``'shap'``).
     model : torch.nn.Module
         The model to explain.
-    dataset_tensor : torch.Tensor
-        Background / reference dataset used by some explainers (e.g. SHAP).
+    X_train : torch.FloatTensor
+        Training data for methods that need a background dataset.
 
     Returns
     -------
-    explainer : Explainer or None
+    explainer : object or None
         Instantiated explainer, or ``None`` if construction failed.
     """
-    extra_kwargs = EXPLAINER_PARAM_DICTS.get(method, {})
+    param_dict = _build_param_dict(method, X_train)
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            explainer = Explainer(
-                method=method,
-                model=model,
-                dataset_tensor=dataset_tensor,
-                **extra_kwargs,
-            )
+            explainer = Explainer(method=method, model=model, param_dict=param_dict)
         return explainer
     except Exception as exc:  # noqa: BLE001
         print(f"  [WARNING] Could not instantiate explainer '{method}': {exc}")
@@ -61,20 +99,23 @@ def _build_explainer(
 
 
 def _get_attributions(
-    explainer: Explainer,
-    X: torch.Tensor,
+    explainer,
+    X: torch.FloatTensor,
+    model: torch.nn.Module,
     method: str,
 ) -> Optional[torch.Tensor]:
-    """Call the explainer and normalise the output shape.
+    """Call the explainer and return a normalised 2-D attribution tensor.
 
     Parameters
     ----------
-    explainer : Explainer
-        Instantiated OpenXAI Explainer.
-    X : torch.Tensor
+    explainer : openxai Explainer object
+        Instantiated explainer.
+    X : torch.FloatTensor
         Input batch of shape ``(n, d)``.
+    model : torch.nn.Module
+        The model (used to get predicted labels for the label argument).
     method : str
-        Explainer name (for logging).
+        Explainer name (for logging only).
 
     Returns
     -------
@@ -84,7 +125,9 @@ def _get_attributions(
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            attrs = explainer.get_explanations(X)
+            with torch.no_grad():
+                preds = torch.argmax(model(X.float()), dim=1)
+            attrs = explainer.get_explanations(X.float(), label=preds)
 
         # Normalise to 2-D float tensor
         if not isinstance(attrs, torch.Tensor):
@@ -102,44 +145,48 @@ def _get_attributions(
 
 def run_all_explainers(
     model: torch.nn.Module,
-    X_test: torch.Tensor,
+    X_test: torch.FloatTensor,
+    X_train: torch.FloatTensor,
     n_samples: int,
 ) -> Dict[str, torch.Tensor]:
-    """Run every explainer in ``config.EXPLAINERS`` on the first *n_samples*
-    rows of ``X_test``.
+    """Run every explainer on the first *n_samples* rows of ``X_test``.
 
     Parameters
     ----------
     model : torch.nn.Module
         Pretrained model in eval mode.
-    X_test : torch.Tensor
+    X_test : torch.FloatTensor
         Full test feature tensor of shape ``(N, d)``.
+    X_train : torch.FloatTensor
+        Full training feature tensor (background for LIME / IG).
     n_samples : int
         Number of samples to explain.
 
     Returns
     -------
     explanations : dict[str, torch.Tensor]
-        Mapping from explainer name to attribution matrix ``(n_samples, d)``.
+        Mapping from display explainer name → attribution matrix ``(n_samples, d)``.
         Explainers that fail are omitted from the dict.
     """
     set_seed(RANDOM_SEED)
     X = X_test[:n_samples]
     explanations: Dict[str, torch.Tensor] = {}
 
-    for method in EXPLAINERS:
-        print(f"  → Running explainer: {method} …")
-        explainer = _build_explainer(method, model, X)
+    for method in EXPLAINER_METHODS:
+        display_name = EXPLAINER_DISPLAY[method]
+        print(f"  → Running explainer: {display_name} (key='{method}') …")
+
+        explainer = _build_explainer(method, model, X_train)
         if explainer is None:
             continue
 
-        attrs = _get_attributions(explainer, X, method)
+        attrs = _get_attributions(explainer, X, model, method)
         if attrs is not None:
-            explanations[method] = attrs
-            print(f"    ✓ {method} — attribution shape: {tuple(attrs.shape)}")
+            explanations[display_name] = attrs
+            print(f"    ✓ {display_name} — attribution shape: {tuple(attrs.shape)}")
 
     print(
         f"[run_all_explainers] Completed. "
-        f"{len(explanations)}/{len(EXPLAINERS)} explainers succeeded."
+        f"{len(explanations)}/{len(EXPLAINER_METHODS)} explainers succeeded."
     )
     return explanations

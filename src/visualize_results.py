@@ -62,60 +62,51 @@ def _save(fig: plt.Figure, path: Path) -> None:
 # ─── Figure 1: Heatmap ────────────────────────────────────────────────────────
 
 def plot_heatmap(df: pd.DataFrame, data_name: str) -> Path:
-    """Render a column-normalised metric × explainer heatmap.
-
-    Each column (metric) is min-max normalised independently so that colour
-    intensity reflects relative rank rather than absolute scale.  Raw values
-    are annotated in each cell.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Results DataFrame of shape ``(n_explainers, n_metrics)``.
-    data_name : str
-        Dataset name used in the figure title and output filename.
-
-    Returns
-    -------
-    out_path : Path
-        Absolute path to the saved PNG.
-    """
+    """Render a column-normalised metric x explainer heatmap."""
     _apply_style()
+    
+    # Ensure consistent column order and handle missing metrics
+    from src.config import METRICS
+    cols = [m for m in METRICS if m in df.columns]
+    df = df[cols]
+    
     norm_df = df.copy().astype(float)
     for col in norm_df.columns:
         col_min, col_max = norm_df[col].min(), norm_df[col].max()
         denom = col_max - col_min if (col_max - col_min) != 0 else 1.0
         norm_df[col] = (norm_df[col] - col_min) / denom
 
-    annot = df.round(4).astype(str).replace("nan", "—")
+    # Format annotations: numeric for valid floats, "-" for NaN
+    annot = df.applymap(lambda v: f"{v:.3f}" if pd.notnull(v) else "—")
 
     # Build column labels with direction arrows
     col_labels = [
-        f"{m}\n({'↑' if METRIC_DIRECTION[m] == 'higher' else '↓'})"
+        f"{m}\n({'↑' if METRIC_DIRECTION.get(m) == 'higher' else '↓'})"
         for m in df.columns
     ]
 
-    fig, ax = plt.subplots(figsize=(max(8, len(df.columns) * 1.6), max(4, len(df) * 0.7)))
+    fig, ax = plt.subplots(figsize=(max(10, len(df.columns) * 1.8), max(5, len(df) * 0.8)))
     sns.heatmap(
         norm_df,
         annot=annot,
-        fmt="s",
+        fmt="",
         cmap="RdYlGn",
-        linewidths=0.5,
+        linewidths=1.0,
         linecolor="white",
         ax=ax,
-        cbar_kws={"label": "Normalised score (column-wise)"},
+        annot_kws={"size": 8},
+        cbar_kws={"label": "Normalised score (column-wise)", "shrink": 0.8},
     )
     ax.set_xticklabels(col_labels, rotation=0, ha="center", fontsize=10)
-    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=9)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0, fontsize=10)
     ax.set_title(
         f"OpenXAI Benchmark Metrics — {data_name.upper()} dataset\n"
         "(column-normalised; raw values annotated)",
-        fontsize=12,
-        pad=12,
+        fontsize=14,
+        pad=20,
     )
     ax.set_xlabel("")
-    ax.set_ylabel("")
+    ax.set_ylabel("Explainer")
 
     out_path = RESULTS_DIR / f"{data_name}_heatmap.png"
     _save(fig, out_path)
@@ -125,39 +116,27 @@ def plot_heatmap(df: pd.DataFrame, data_name: str) -> Path:
 # ─── Figure 2: Bar charts (one per metric) ───────────────────────────────────
 
 def plot_bar_charts(df: pd.DataFrame, data_name: str) -> Path:
-    """Bar-chart grid with one subplot per metric.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Results DataFrame of shape ``(n_explainers, n_metrics)``.
-    data_name : str
-        Dataset name used in the title and filename.
-
-    Returns
-    -------
-    out_path : Path
-        Absolute path to the saved PNG.
-    """
+    """Bar-chart grid with one subplot per metric."""
     _apply_style()
-    metrics = df.columns.tolist()
+    from src.config import METRICS
+    metrics = [m for m in METRICS if m in df.columns]
     n_metrics = len(metrics)
     ncols = 3
     nrows = int(np.ceil(n_metrics / ncols))
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 4.5, nrows * 3.8))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 5, nrows * 4))
     axes = np.array(axes).flatten()
 
-    colors = sns.color_palette("husl", len(df))
+    colors = sns.color_palette("viridis", len(df))
 
     for idx, metric in enumerate(metrics):
         ax = axes[idx]
         values = df[metric].fillna(0)
-        bars = ax.bar(df.index, values, color=colors, edgecolor="white", linewidth=0.8)
+        bars = ax.bar(df.index, values, color=colors, edgecolor="black", linewidth=0.5)
 
         # Annotate bar tops
         for bar, val in zip(bars, df[metric]):
-            if np.isnan(val):
+            if pd.isnull(val):
                 label = "N/A"
                 ypos = 0
             else:
@@ -169,26 +148,26 @@ def plot_bar_charts(df: pd.DataFrame, data_name: str) -> Path:
                 label,
                 ha="center",
                 va="bottom",
-                fontsize=7.5,
+                fontsize=8,
+                fontweight="bold"
             )
 
         direction = METRIC_DIRECTION.get(metric, "")
         arrow = "↑ higher better" if direction == "higher" else "↓ lower better"
-        ax.set_title(f"{metric}  ({arrow})", fontsize=10)
-        ax.set_ylabel("Score")
+        ax.set_title(f"{metric}\n({arrow})", fontsize=11, pad=10)
+        ax.set_ylabel("Score", fontsize=9)
         ax.set_xticks(range(len(df.index)))
-        ax.set_xticklabels(df.index, rotation=30, ha="right", fontsize=8)
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
+        ax.set_xticklabels(df.index, rotation=35, ha="right", fontsize=9)
+        ax.grid(axis='y', linestyle='--', alpha=0.5)
 
     # Hide unused subplots
     for ax in axes[n_metrics:]:
-        ax.set_visible(False)
+        ax.set_axis_off()
 
     fig.suptitle(
-        f"Per-Metric Bar Charts — {data_name.upper()} dataset",
-        fontsize=13,
-        y=1.02,
+        f"Per-Metric Benchmark Results — {data_name.upper()}",
+        fontsize=15,
+        y=1.05,
     )
     fig.tight_layout()
 
