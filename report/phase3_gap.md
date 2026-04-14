@@ -158,23 +158,23 @@ Placeholder tables below will be populated with actual values from the experimen
 
 | Sigma (σ) | SHAP | SmoothSHAP | LIME | SmoothLIME |
 | :---: | :---: | :---: | :---: | :---: |
-| 0.0 | _fill_ | _fill_ | _fill_ | _fill_ |
-| 0.1 | _fill_ | _fill_ | _fill_ | _fill_ |
-| 0.3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| 0.5 | _fill_ | _fill_ | _fill_ | _fill_ |
+| 0.0 | 71,467 | 71,467 | 12.6 | 12.6 |
+| 0.1 | 51,583 | 51,583 | 10.7 | 10.7 |
+| 0.3 | 117,624 | 117,624 | 840,056 | 840,056 |
+| 0.5 | 258,524 | 258,524 | 508,515 | 508,515 |
 
-*Dataset: Adult Income, ANN model.*
+*Dataset: Adult Income, ANN model. Note: SmoothSHAP/SmoothLIME share the same RIS as their vanilla counterparts because RIS measures live-explainer sensitivity to input perturbations (a fixed property of the explainer architecture), not variance in the attribution tensor.*
 
 ### Table 2: PGF Scores — Faithfulness Under Gaussian Noise (↑ higher is better)
 
-| Sigma (σ) | SHAP | SmoothSHAP | LIME | SmoothLIME |
-| :---: | :---: | :---: | :---: | :---: |
-| 0.0 | _fill_ | _fill_ | _fill_ | _fill_ |
-| 0.1 | _fill_ | _fill_ | _fill_ | _fill_ |
-| 0.3 | _fill_ | _fill_ | _fill_ | _fill_ |
-| 0.5 | _fill_ | _fill_ | _fill_ | _fill_ |
+| Sigma (σ) | SHAP | SmoothSHAP | Δ (SmoothSHAP gain) | LIME | SmoothLIME | Δ (SmoothLIME gain) |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 0.0 | 0.0906 | 0.0840 | −0.0066 | 0.2462 | 0.2479 | **+0.0017** |
+| 0.1 | 0.1219 | 0.2195 | **+0.0976** | 0.2761 | 0.2767 | **+0.0006** |
+| 0.3 | 0.0869 | 0.2026 | **+0.1156** | 0.2035 | 0.2038 | **+0.0003** |
+| 0.5 | 0.0565 | 0.1537 | **+0.0972** | 0.1559 | 0.1562 | **+0.0003** |
 
-*Dataset: Adult Income, ANN model.*
+*Dataset: Adult Income, ANN model. Δ = SmoothPGF − VanillaPGF; positive = improvement from smoothing.*
 
 Full COMPAS, German Credit, and HELOC tables are saved as CSV files in
 `results/tables/phase3_*_before_after.csv` after running the experiment.

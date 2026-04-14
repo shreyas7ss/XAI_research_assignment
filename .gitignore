@@ -152,14 +152,9 @@ cython_debug/
 
 # ─── Project Specific ────────────────────────────────────────────────────────
 
-# OpenXAI downloads datasets and models into a folder (usually 'data' or 'models')
-data/
-models/
 
-# Ignore generated results if you don't want to track experiment runs
-results/
-report/*.html
-report/*.pdf
+
+
 
 # Local log files
 run.log
