@@ -1,0 +1,12 @@
+git+https://github.com/AI4LIFE-GROUP/OpenXAI.git
+torch
+torchvision
+numpy
+pandas
+scikit-learn
+matplotlib
+seaborn
+lime
+shap
+captum
+tqdm
