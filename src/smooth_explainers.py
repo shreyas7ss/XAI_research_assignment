@@ -2,21 +2,26 @@
 smooth_explainers.py — Noise-aware SmoothSHAP and SmoothLIME explainers for
 the Phase 3 extension of the OpenXAI replication project.
 
+FIX LOG (Bug 3):
+----------------
+Original bug: run_smooth_explainers() was receiving X_noisy_np (already noisy)
+and then SmoothExplainer.get_explanations() was adding sigma noise AGAIN on top,
+effectively doubling the noise level (e.g. sigma=0.3 became ~sigma=0.6).
+
+Fix: SmoothExplainer now accepts an explicit `internal_sigma` parameter that
+controls the noise added during averaging. The outer pipeline always passes
+the CLEAN X_eval to run_smooth_explainers(), and internal_sigma is set to
+the desired sigma level. This gives correct, single-level noise averaging.
+
 Formal definition
 -----------------
-Given an explainer E and K noisy copies of input x:
+Given an explainer E, clean input x, and target noise level sigma:
 
     x_k = x + epsilon_k,  epsilon_k ~ N(0, sigma² I),  k = 1 … K
 
     SmoothExplainer(x) = (1/K') * sum_{k=1}^{K'} E(x_k)
 
-where K' ≤ K is the number of *successful* runs (individual failures are
-suppressed with a warning).  If K' < K/2 a warning is emitted but the
-partial mean is still returned so the outer pipeline never crashes.
-
-Both SmoothSHAP and SmoothLIME are exposed via the convenience function
-``run_smooth_explainers`` which matches the return signature used by
-``run_all_explainers`` in ``run_explainers.py``.
+where K' <= K is the number of successful runs.
 """
 
 from __future__ import annotations
@@ -37,16 +42,6 @@ from src.noise_utils import add_gaussian_noise
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 def _build_param_dict_smooth(method: str, X_train: torch.FloatTensor) -> dict:
-    """Build an openxai-compatible param_dict for SHAP or LIME.
-
-    Args:
-        method (str): Explainer method key: ``'shap'`` or ``'lime'``.
-        X_train (torch.FloatTensor): Full training feature tensor used as the
-            background / reference distribution.
-
-    Returns:
-        dict: Ready-to-use parameter dictionary for ``openxai.Explainer``.
-    """
     if method == "lime":
         return utils.fill_param_dict("lime", {"n_samples": 100}, X_train)
     elif method == "shap":
@@ -57,28 +52,20 @@ def _build_param_dict_smooth(method: str, X_train: torch.FloatTensor) -> dict:
 # ─── SmoothExplainer class ────────────────────────────────────────────────────
 
 class SmoothExplainer:
-    """Noise-averaged wrapper around an ``openxai.Explainer`` (SHAP or LIME).
+    """Noise-averaged wrapper around an openxai.Explainer (SHAP or LIME).
 
-    For each input x the explainer is run K times on noisy copies
-    ``x_k = x + N(0, sigma²)``.  The final attribution is the mean of all
-    successful runs.
-
-    The class intentionally mirrors the ``openxai.Explainer`` interface
-    (specifically ``get_explanations(X, label=...)``), making it a drop-in
-    replacement that requires *no changes* to ``compute_metrics.py``.
+    IMPORTANT: This class expects CLEAN inputs x. It generates noisy copies
+    internally using internal_sigma. Do NOT pre-noise the inputs before
+    passing to get_explanations() — that was the original Bug 3.
 
     Args:
-        base_method (str): ``'shap'`` or ``'lime'`` — the underlying explainer.
+        base_method (str): 'shap' or 'lime'.
         model (torch.nn.Module): Pretrained model in eval mode.
-        dataset_tensor (torch.Tensor): Full training feature tensor,
-            used as background for LIME and IG.
-        K (int): Number of noisy copies to average over.  Default 20.
-        sigma (float): Standard deviation of the added noise.  Default 0.1.
-        seed (int): Base random seed; each of the K copies uses
-            ``seed + k`` for statistical independence.  Default 42.
-
-    Raises:
-        ValueError: If ``base_method`` is not ``'shap'`` or ``'lime'``.
+        dataset_tensor (torch.Tensor): Full training feature tensor.
+        K (int): Number of noisy copies to average over. Default 20.
+        internal_sigma (float): Std dev of noise added to each copy. This
+            should match the sigma level of the experiment. Default 0.1.
+        seed (int): Base random seed. Default RANDOM_SEED.
     """
 
     def __init__(
@@ -87,7 +74,7 @@ class SmoothExplainer:
         model: torch.nn.Module,
         dataset_tensor: torch.Tensor,
         K: int = 20,
-        sigma: float = 0.1,
+        internal_sigma: float = 0.1,
         seed: int = RANDOM_SEED,
     ) -> None:
         if base_method not in ("shap", "lime"):
@@ -98,10 +85,9 @@ class SmoothExplainer:
         self.model = model
         self.dataset_tensor = dataset_tensor
         self.K = K
-        self.sigma = sigma
+        self.internal_sigma = internal_sigma  # FIX: renamed from sigma for clarity
         self.seed = seed
 
-        # Build the underlying openxai explainer once (background data fixed)
         set_seed(seed)
         param_dict = _build_param_dict_smooth(base_method, dataset_tensor)
         try:
@@ -112,44 +98,32 @@ class SmoothExplainer:
                     model=model,
                     param_dict=param_dict,
                 )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise RuntimeError(
                 f"[SmoothExplainer] Failed to build base '{base_method}' explainer: {exc}"
             ) from exc
-
-    # ── Public interface matching openxai.Explainer ───────────────────────────
 
     def get_explanations(
         self,
         x: torch.Tensor,
         label: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Return noise-averaged feature attributions for input batch ``x``.
+        """Return noise-averaged attributions for CLEAN input batch x.
 
-        Generates K perturbed copies of ``x``, calls the base explainer on
-        each, and returns the element-wise mean over successful runs.
+        Generates K noisy copies x_k = x + N(0, internal_sigma²),
+        runs the base explainer on each, and returns the element-wise mean.
 
         Args:
-            x (torch.Tensor): Input feature batch, shape (n_samples, n_features).
-            label (torch.Tensor | None): Predicted-class labels of shape
-                (n_samples,).  If ``None``, labels are inferred from the model.
+            x (torch.Tensor): CLEAN input features, shape (n_samples, n_features).
+                Do NOT pass pre-noised inputs here.
+            label (torch.Tensor | None): Predicted labels. Inferred if None.
 
         Returns:
-            torch.Tensor: Averaged attribution matrix, shape
-            (n_samples, n_features), dtype float32.
-
-        Warns:
-            RuntimeWarning: If fewer than K/2 of the K runs succeed.
-
-        Notes:
-            * Failed individual noisy runs are silently skipped (counted).
-            * The function never raises an exception to the outer pipeline.
+            torch.Tensor: Averaged attributions, shape (n_samples, n_features).
         """
         set_seed(self.seed)
-
         x_np = x.detach().cpu().numpy().astype(np.float32)
 
-        # Infer labels once from the clean input
         if label is None:
             with torch.no_grad():
                 label = torch.argmax(self.model(x.float()), dim=1)
@@ -158,10 +132,10 @@ class SmoothExplainer:
         n_success = 0
 
         for k in range(self.K):
-            copy_seed = self.seed + k + 1  # distinct per copy
+            copy_seed = self.seed + k + 1
 
-            # Add noise (sigma=0.0 returns original array unchanged)
-            x_k_np = add_gaussian_noise(x_np, sigma=self.sigma, seed=copy_seed, clip=True)
+            # FIX: Always noise from the CLEAN x_np using internal_sigma
+            x_k_np = add_gaussian_noise(x_np, sigma=self.internal_sigma, seed=copy_seed, clip=True)
             x_k = torch.tensor(x_k_np, dtype=torch.float32)
 
             try:
@@ -169,7 +143,6 @@ class SmoothExplainer:
                     warnings.simplefilter("ignore")
                     attrs_k = self._explainer.get_explanations(x_k, label=label)
 
-                # Normalise to numpy float32
                 if isinstance(attrs_k, torch.Tensor):
                     attrs_np = attrs_k.detach().cpu().numpy().astype(np.float32)
                 else:
@@ -178,34 +151,27 @@ class SmoothExplainer:
                 if attrs_np.ndim == 1:
                     attrs_np = np.tile(attrs_np, (x_np.shape[0], 1))
 
-                if accumulated is None:
-                    accumulated = attrs_np
-                else:
-                    accumulated = accumulated + attrs_np
+                accumulated = attrs_np if accumulated is None else accumulated + attrs_np
                 n_success += 1
 
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 warnings.warn(
                     f"[SmoothExplainer / {self.base_method}] run {k+1}/{self.K} failed: {exc}",
-                    RuntimeWarning,
-                    stacklevel=2,
+                    RuntimeWarning, stacklevel=2,
                 )
 
-        # ── Guard: at least K/2 runs must succeed ────────────────────────────
         if n_success < self.K / 2:
             warnings.warn(
                 f"[SmoothExplainer / {self.base_method}] Only {n_success}/{self.K} runs "
                 "succeeded (< K/2). Result quality may be degraded.",
-                RuntimeWarning,
-                stacklevel=2,
+                RuntimeWarning, stacklevel=2,
             )
 
         if accumulated is None or n_success == 0:
             warnings.warn(
                 f"[SmoothExplainer / {self.base_method}] ALL runs failed. "
                 "Returning zero attributions.",
-                RuntimeWarning,
-                stacklevel=2,
+                RuntimeWarning, stacklevel=2,
             )
             return torch.zeros(x.shape, dtype=torch.float32)
 
@@ -217,61 +183,58 @@ class SmoothExplainer:
 
 def run_smooth_explainers(
     model: torch.nn.Module,
-    X_eval: np.ndarray,
+    X_clean: np.ndarray,          # FIX: renamed from X_eval, must be CLEAN
     X_train: np.ndarray,
-    sigma: float,
+    sigma: float,                  # FIX: this now controls internal_sigma only
     K: int = 20,
     seed: int = RANDOM_SEED,
 ) -> Dict[str, np.ndarray]:
-    """Run SmoothSHAP and SmoothLIME on ``X_eval`` and return attribution arrays.
+    """Run SmoothSHAP and SmoothLIME on CLEAN X_clean with internal noise sigma.
 
-    This function mirrors the return format of ``run_all_explainers`` so that
-    results can be fed directly into ``compute_metrics_for_dataset`` without
-    any changes to that module.
+    FIX: Previously this function received X_noisy and added more noise inside,
+    doubling the effective noise level. Now it always receives the clean inputs
+    and controls noise level solely through internal_sigma.
 
     Args:
-        model (torch.nn.Module): Pretrained model in eval mode.
-        X_eval (np.ndarray): Evaluation feature matrix,
-            shape (n_samples, n_features).  May already be a noisy version.
-        X_train (np.ndarray): Training feature matrix used as background
-            for LIME.
-        sigma (float): Noise level for the smooth explainers.
-        K (int): Number of noisy copies to average.  Default 20.
-        seed (int): Base random seed.  Default ``RANDOM_SEED``.
+        model: Pretrained model in eval mode.
+        X_clean (np.ndarray): CLEAN evaluation features, shape (n, d).
+            This must be the original clean data, NOT pre-noised.
+        X_train (np.ndarray): Training features for LIME background.
+        sigma (float): Noise level for internal averaging (single source of noise).
+        K (int): Number of noisy copies to average. Default 20.
+        seed (int): Base random seed. Default RANDOM_SEED.
 
     Returns:
-        dict[str, np.ndarray]: ``{'smooth_shap': array, 'smooth_lime': array}``
-        where each array has shape (n_samples, n_features).  If a method fails
-        completely, it is omitted from the dict.
+        dict[str, np.ndarray]: {'smooth_shap': array, 'smooth_lime': array}
     """
     set_seed(seed)
 
-    X_eval_t = torch.tensor(X_eval, dtype=torch.float32)
+    X_clean_t = torch.tensor(X_clean, dtype=torch.float32)
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
 
     results: Dict[str, np.ndarray] = {}
 
     for method, key in [("shap", "smooth_shap"), ("lime", "smooth_lime")]:
-        print(f"  → Running {key} (K={K}, sigma={sigma}) …")
+        print(f"  → Running {key} (K={K}, internal_sigma={sigma}) on CLEAN inputs …")
         try:
             explainer = SmoothExplainer(
                 base_method=method,
                 model=model,
                 dataset_tensor=X_train_t,
                 K=K,
-                sigma=sigma,
+                internal_sigma=sigma,  # FIX: clean separation of concerns
                 seed=seed,
             )
             with torch.no_grad():
-                preds = torch.argmax(model(X_eval_t), dim=1)
-            attrs_t = explainer.get_explanations(X_eval_t, label=preds)
+                preds = torch.argmax(model(X_clean_t), dim=1)
+            # FIX: pass CLEAN inputs — noise is handled internally
+            attrs_t = explainer.get_explanations(X_clean_t, label=preds)
             results[key] = attrs_t.cpu().numpy()
             print(f"    ✓ {key} — shape: {results[key].shape}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             warnings.warn(
                 f"[run_smooth_explainers] {key} failed entirely: {exc}",
-                RuntimeWarning,
-                stacklevel=2,
+                RuntimeWarning, stacklevel=2,
             )
 
     return results

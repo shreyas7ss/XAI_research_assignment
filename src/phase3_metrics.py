@@ -1,20 +1,35 @@
 """
-phase3_metrics.py — Orchestrates the two core Phase 3 studies:
+phase3_metrics.py — Orchestrates the two core Phase 3 studies.
 
-1. ``degradation_study``     — sweeps sigma levels for all 7 original OpenXAI
-                               explainers and records how all 5 metrics change.
-2. ``before_after_comparison`` — compares SHAP vs SmoothSHAP and LIME vs
-                                 SmoothLIME using RIS and PGF across sigma levels.
+FIX LOG:
+--------
+Bug 1 (Stability for smooth explainers used vanilla object):
+    Before: live_exp = _build_explainer(vanilla_key, ...) → RIS identical for
+            SHAP and SmoothSHAP because eval_relative_stability calls
+            explainer_obj.get_explanations() internally.
+    Fix:    Build a SmoothExplainer object and pass it as the live explainer
+            for stability computation of smooth variants. SmoothExplainer
+            implements get_explanations() so it's a drop-in.
 
-Both functions return tidy MultiIndex DataFrames indexed by (sigma, explainer)
-and save per-sigma CSVs to ``results/tables/``.
+Bug 2 (Faithfulness evaluated on noisy inputs):
+    Before: _compute_faithfulness(attrs, X_noisy_t, ...) — PGF perturbs
+            already-noisy inputs, producing unpredictable prediction gaps.
+    Fix:    _compute_faithfulness always receives X_clean_t as the input
+            tensor. The explanations (attrs) still come from noisy inputs,
+            but the evaluation ground is always the clean data.
+
+Bug 3 (Double noise in run_smooth_explainers):
+    Before: X_noisy_np was passed to run_smooth_explainers, then noise was
+            added again inside SmoothExplainer, doubling sigma.
+    Fix:    X_clean (original data) is always passed to run_smooth_explainers.
+            Noise is applied only once, internally, via internal_sigma=sigma.
 """
 
 from __future__ import annotations
 
 import os
 import warnings
-from typing import List, Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
@@ -28,9 +43,9 @@ import openxai.experiment_utils as utils
 from src.config import RANDOM_SEED, TABLES_DIR, ensure_dirs, set_seed
 from src.noise_utils import SIGMA_LEVELS, noise_experiment_inputs
 from src.run_explainers import EXPLAINER_METHODS, EXPLAINER_DISPLAY, _build_explainer
-from src.smooth_explainers import run_smooth_explainers
+from src.smooth_explainers import run_smooth_explainers, SmoothExplainer
 
-# ─── Monkey-patch (same fix as in compute_metrics.py) ─────────────────────────
+# ─── Monkey-patch ─────────────────────────────────────────────────────────────
 def _fixed_convert_k(k, n_feat):
     if k == -1:
         return n_feat
@@ -41,7 +56,7 @@ def _fixed_convert_k(k, n_feat):
     return k
 
 utils.convert_k_to_int = _fixed_convert_k
-# ──────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 TOP_K_FRACTION: float = 0.25
 PERTURB_STD: float = 0.1
@@ -50,62 +65,36 @@ PERTURB_STD: float = 0.1
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 def _get_feature_metadata(data_name: str):
-    """Load feature metadata for a dataset via the openxai DataLoader.
-
-    Args:
-        data_name (str): Dataset identifier (e.g. ``'adult'``, ``'compas'``).
-
-    Returns:
-        feature_metadata: Feature type metadata object from openxai.
-    """
     from openxai.dataloader import ReturnLoaders
     trainloader, _ = ReturnLoaders(data_name, download=True, batch_size=256)
     return trainloader.dataset.feature_metadata
 
 
 def _safe_scalar(result, metric_name: str, exp_name: str) -> float:
-    """Extract a scalar from an openxai metric return value, returning NaN on error.
-
-    Args:
-        result: Return value of an openxai metric function (usually a tuple).
-        metric_name (str): Metric name for warning messages.
-        exp_name (str): Explainer name for warning messages.
-
-    Returns:
-        float: Extracted scalar or ``float('nan')`` on failure.
-    """
     try:
         val = result[1] if isinstance(result, (tuple, list)) else result
         if isinstance(val, torch.Tensor):
             val = val.item()
         return float(val)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         print(f"    [WARNING] Cannot extract {metric_name} for '{exp_name}': {exc}")
         return float("nan")
 
 
 def _compute_faithfulness(
     attrs: torch.Tensor,
-    X_noisy: torch.Tensor,
+    X_clean: torch.Tensor,       # FIX Bug 2: always clean inputs
     model: torch.nn.Module,
     k: int,
     perturb_method,
     feature_metadata,
     exp_name: str,
 ) -> tuple[float, float]:
-    """Compute PGF and PGU for a single (explainer, sigma) combination.
+    """Compute PGF and PGU.
 
-    Args:
-        attrs (torch.Tensor): Attribution tensor, shape (n, d).
-        X_noisy (torch.Tensor): Noisy feature matrix, shape (n, d).
-        model (torch.nn.Module): Pretrained model.
-        k (int): Number of top/bottom features to mask.
-        perturb_method: openxai perturbation method object.
-        feature_metadata: Feature type metadata from openxai.
-        exp_name (str): Explainer name for logging.
-
-    Returns:
-        tuple[float, float]: (PGF score, PGU score).
+    FIX Bug 2: X_clean is always the original clean data regardless of
+    which sigma level produced the attributions. This keeps the evaluation
+    ground stable and comparable across sigma levels.
     """
     set_seed(RANDOM_SEED)
     pgf = float("nan")
@@ -115,7 +104,7 @@ def _compute_faithfulness(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             res = eval_pred_faithfulness(
-                explanations=attrs, inputs=X_noisy, model=model, k=k,
+                explanations=attrs, inputs=X_clean, model=model, k=k,
                 perturb_method=perturb_method, feature_metadata=feature_metadata,
                 n_samples=100, invert=False, seed=RANDOM_SEED,
             )
@@ -127,7 +116,7 @@ def _compute_faithfulness(
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             res = eval_pred_faithfulness(
-                explanations=attrs, inputs=X_noisy, model=model, k=k,
+                explanations=attrs, inputs=X_clean, model=model, k=k,
                 perturb_method=perturb_method, feature_metadata=feature_metadata,
                 n_samples=100, invert=True, seed=RANDOM_SEED,
             )
@@ -146,18 +135,12 @@ def _compute_stability(
     feature_metadata,
     exp_name: str,
 ) -> tuple[float, float, float]:
-    """Compute RIS, RRS, ROS for a single (explainer, sigma) combination.
+    """Compute RIS, RRS, ROS.
 
-    Args:
-        explainer_obj: Live openxai Explainer object (needed for stability metrics).
-        X_noisy (torch.Tensor): Noisy feature matrix.
-        model (torch.nn.Module): Pretrained model.
-        perturb_method: openxai perturbation method object.
-        feature_metadata: Feature type metadata from openxai.
-        exp_name (str): Explainer name for logging.
-
-    Returns:
-        tuple[float, float, float]: (RIS, RRS, ROS) scores, any failing as NaN.
+    Note: Stability is intentionally computed on X_noisy because RIS measures
+    how stable the explainer is to small perturbations AROUND the noisy point.
+    This is correct — we want to know if the explainer is stable at the
+    operating point (noisy input), not at the clean input.
     """
     set_seed(RANDOM_SEED)
     scores = []
@@ -174,7 +157,7 @@ def _compute_stability(
         except Exception as exc:
             print(f"    [WARNING] {metric} failed for '{exp_name}': {exc}")
             scores.append(float("nan"))
-    return tuple(scores)  # type: ignore[return-value]
+    return tuple(scores)
 
 
 # ─── Study 1: Degradation Study ───────────────────────────────────────────────
@@ -189,26 +172,8 @@ def degradation_study(
 ) -> pd.DataFrame:
     """Sweep sigma levels, re-run all 7 explainers, record all 5 metrics.
 
-    For every sigma in ``sigma_levels``:
-      1. Add Gaussian noise to ``X_eval`` (sigma=0.0 returns X_eval unchanged).
-      2. Run all 7 openxai explainers on the noisy inputs.
-      3. Compute PGF, PGU, RIS, RRS, ROS.
-      4. Save per-sigma CSV to ``results/tables/phase3_{dataset}_sigma{s}.csv``.
-      5. Print progress lines: ``sigma=X | explainer=Y | RIS=Z``.
-
-    Args:
-        model (torch.nn.Module): Pretrained model in eval mode.
-        X_eval (np.ndarray): Clean evaluation feature matrix,
-            shape (n_samples, n_features).
-        X_train (np.ndarray): Training feature matrix (background for LIME/IG).
-        dataset_name (str): Dataset identifier (for file naming and logging).
-        sigma_levels (list[float]): Noise levels to sweep.
-            Defaults to ``SIGMA_LEVELS = [0.0, 0.1, 0.3, 0.5]``.
-
-    Returns:
-        pd.DataFrame: MultiIndex DataFrame indexed by (sigma, explainer) with
-        columns ``['PGF', 'PGU', 'RIS', 'RRS', 'ROS']``.
-        Any failed metric is stored as NaN.
+    FIX Bug 2: Faithfulness is always evaluated against clean X_eval,
+    regardless of the sigma level used to generate attributions.
     """
     ensure_dirs()
     os.makedirs(TABLES_DIR, exist_ok=True)
@@ -217,41 +182,38 @@ def degradation_study(
     perturb_method = get_perturb_method(std=PERTURB_STD, data_name=dataset_name)
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    # FIX Bug 2: keep clean tensor permanently for faithfulness evaluation
+    X_clean_t = torch.tensor(X_eval, dtype=torch.float32)
+
     n_features = X_eval.shape[1]
     k = max(1, int(TOP_K_FRACTION * n_features))
 
-    # Prepare noisy inputs dict
     noisy_inputs = noise_experiment_inputs(X_eval, sigma_levels=sigma_levels)
-
-    # Map display names back to openxai keys for rebuilding live explainer objects
-    display_to_method = {v: mk for mk, v in EXPLAINER_DISPLAY.items()}
 
     all_records: list[dict] = []
 
     for sigma in sigma_levels:
         X_noisy_np = noisy_inputs[sigma]
         X_noisy_t = torch.tensor(X_noisy_np, dtype=torch.float32)
-        sigma_records: list[dict] = []
 
-        # ── Check for existing results ───────────────────────────────────────
         sigma_csv = TABLES_DIR / f"phase3_{dataset_name}_sigma{sigma}.csv"
         if resume and sigma_csv.exists():
             print(f"  [SKIP] sigma={sigma:.1f} | Already exists: {sigma_csv}")
             try:
                 df_loaded = pd.read_csv(sigma_csv)
-                # Convert back to records list format
                 for _, row_data in df_loaded.iterrows():
                     record = row_data.to_dict()
                     record["sigma"] = sigma
                     all_records.append(record)
                 continue
             except Exception as exc:
-                print(f"  [WARNING] Failed to load existing CSV '{sigma_csv}': {exc}. Recomputing.")
+                print(f"  [WARNING] Failed to load '{sigma_csv}': {exc}. Recomputing.")
+
+        sigma_records: list[dict] = []
 
         for method in EXPLAINER_METHODS:
             exp_name = EXPLAINER_DISPLAY[method]
 
-            # ── Build explainer and get attributions ─────────────────────────
             explainer_obj = _build_explainer(method, model, X_train_t)
             if explainer_obj is None:
                 continue
@@ -270,49 +232,39 @@ def degradation_study(
                     attrs = attrs.unsqueeze(0).expand(X_noisy_t.shape[0], -1)
                 attrs = attrs.detach()
             except Exception as exc:
-                print(f"  [WARNING] sigma={sigma} | explainer={exp_name} | attribution fail: {exc}")
+                print(f"  [WARNING] sigma={sigma} | {exp_name} | attribution fail: {exc}")
                 continue
 
-            # ── Faithfulness ─────────────────────────────────────────────────
+            # FIX Bug 2: pass X_clean_t, not X_noisy_t
             pgf, pgu = _compute_faithfulness(
-                attrs, X_noisy_t, model, k, perturb_method, feature_metadata, exp_name
+                attrs, X_clean_t, model, k, perturb_method, feature_metadata, exp_name
             )
 
-            # ── Stability (rebuild live explainer for the noisy X) ───────────
-            # Stability metrics always require the live explainer object.
-            # We rebuild using the noisy X_train substitution is not needed;
-            # openxai's eval_relative_stability perturbation starts from X_noisy.
+            # Stability: use X_noisy_t (correct — measuring stability at operating point)
             live_exp = _build_explainer(method, model, X_train_t)
             ris, rrs, ros = _compute_stability(
                 live_exp, X_noisy_t, model, perturb_method, feature_metadata, exp_name
             )
 
             row = {
-                "sigma": sigma,
-                "explainer": exp_name,
-                "PGF": pgf,
-                "PGU": pgu,
-                "RIS": ris,
-                "RRS": rrs,
-                "ROS": ros,
+                "sigma": sigma, "explainer": exp_name,
+                "PGF": pgf, "PGU": pgu,
+                "RIS": ris, "RRS": rrs, "ROS": ros,
             }
             all_records.append(row)
             sigma_records.append(row)
             print(
-                f"  sigma={sigma:.1f} | explainer={exp_name:<8} "
+                f"  sigma={sigma:.1f} | {exp_name:<8} "
                 f"| PGF={pgf:.4f} | PGU={pgu:.4f} | RIS={ris:.4f}"
             )
 
-        # ── Save per-sigma CSV ────────────────────────────────────────────────
         if sigma_records:
             df_sigma = pd.DataFrame(sigma_records).set_index("explainer")
             df_sigma = df_sigma.drop(columns=["sigma"])
             csv_path = TABLES_DIR / f"phase3_{dataset_name}_sigma{sigma}.csv"
-            os.makedirs(TABLES_DIR, exist_ok=True)
             df_sigma.to_csv(csv_path)
             print(f"  [save] CSV → {csv_path}")
 
-    # ── Build MultiIndex DataFrame ────────────────────────────────────────────
     if not all_records:
         return pd.DataFrame()
 
@@ -321,7 +273,6 @@ def degradation_study(
     df = df[["PGF", "PGU", "RIS", "RRS", "ROS"]]
     df.index.names = ["sigma", "explainer"]
 
-    # Save full summary CSV
     full_csv = TABLES_DIR / f"phase3_{dataset_name}_degradation_full.csv"
     df.to_csv(full_csv)
     print(f"\n[degradation_study] Full results → {full_csv}")
@@ -340,28 +291,16 @@ def before_after_comparison(
     seed: int = RANDOM_SEED,
     resume: bool = False,
 ) -> pd.DataFrame:
-    """Compare vanilla SHAP/LIME against SmoothSHAP/SmoothLIME across sigma levels.
+    """Compare vanilla SHAP/LIME vs SmoothSHAP/SmoothLIME across sigma levels.
 
-    For each sigma in ``sigma_levels``:
-      1. Run vanilla SHAP and LIME on the noisy inputs.
-      2. Run SmoothSHAP and SmoothLIME on the noisy inputs (K copies averaged).
-      3. Compute RIS and PGF for all four.
-      4. Compute delta columns (absolute improvement of smooth over vanilla).
+    FIX Bug 1: SmoothSHAP/SmoothLIME stability now uses a real SmoothExplainer
+               object, so eval_relative_stability calls SmoothExplainer.get_explanations()
+               internally — giving correct, distinct RIS values.
 
-    Args:
-        model (torch.nn.Module): Pretrained model in eval mode.
-        X_eval (np.ndarray): Clean evaluation feature matrix.
-        X_train (np.ndarray): Training feature matrix (background for LIME).
-        dataset_name (str): Dataset identifier (for file naming and logging).
-        sigma_levels (list[float]): Noise levels to sweep.
-        K (int): Number of noisy copies for SmoothExplainer averaging.
-        seed (int): Base random seed.  Default ``RANDOM_SEED``.
+    FIX Bug 2: Faithfulness always evaluated on X_clean_t.
 
-    Returns:
-        pd.DataFrame: MultiIndex DataFrame indexed by (sigma, explainer).
-        Columns: ``['RIS', 'PGF', 'delta_RIS', 'delta_PGF']``.
-        ``delta_RIS`` = vanilla_RIS − smooth_RIS  (positive = improvement).
-        ``delta_PGF`` = smooth_PGF − vanilla_PGF  (positive = improvement).
+    FIX Bug 3: run_smooth_explainers() receives X_clean (not X_noisy).
+               Noise is applied only once, internally.
     """
     ensure_dirs()
     os.makedirs(TABLES_DIR, exist_ok=True)
@@ -370,6 +309,9 @@ def before_after_comparison(
     perturb_method = get_perturb_method(std=PERTURB_STD, data_name=dataset_name)
 
     X_train_t = torch.tensor(X_train, dtype=torch.float32)
+    # FIX Bug 2: permanent clean tensor for faithfulness
+    X_clean_t = torch.tensor(X_eval, dtype=torch.float32)
+
     n_features = X_eval.shape[1]
     k = max(1, int(TOP_K_FRACTION * n_features))
 
@@ -381,21 +323,18 @@ def before_after_comparison(
         X_noisy_np = noisy_inputs[sigma]
         X_noisy_t = torch.tensor(X_noisy_np, dtype=torch.float32)
 
-        # ── Check for existing results ───────────────────────────────────────
         ba_sigma_csv = TABLES_DIR / f"phase3_{dataset_name}_ba_sigma{sigma}.csv"
         if resume and ba_sigma_csv.exists():
             print(f"  [SKIP] sigma={sigma:.1f} | Already exists: {ba_sigma_csv}")
             try:
                 df_loaded = pd.read_csv(ba_sigma_csv)
-                # If loaded df has MultiIndex after reading, handle it.
-                # Usually pd.read_csv on a tidy CSV is fine.
                 for _, row_data in df_loaded.iterrows():
                     record = row_data.to_dict()
                     record["sigma"] = sigma
                     all_records.append(record)
                 continue
             except Exception as exc:
-                print(f"  [WARNING] Failed to load existing CSV '{ba_sigma_csv}': {exc}. Recomputing.")
+                print(f"  [WARNING] Failed to load '{ba_sigma_csv}': {exc}. Recomputing.")
 
         sigma_ba_records: list[dict] = []
 
@@ -418,13 +357,15 @@ def before_after_comparison(
                 if attrs.ndim == 1:
                     attrs = attrs.unsqueeze(0).expand(X_noisy_t.shape[0], -1)
             except Exception as exc:
-                print(f"  [WARNING] vanilla {display} attribution fail at sigma={sigma}: {exc}")
+                print(f"  [WARNING] vanilla {display} attr fail at sigma={sigma}: {exc}")
                 vanilla_scores[display] = {"RIS": float("nan"), "PGF": float("nan")}
                 continue
 
+            # FIX Bug 2: evaluate faithfulness on clean inputs
             pgf, _ = _compute_faithfulness(
-                attrs, X_noisy_t, model, k, perturb_method, feature_metadata, display
+                attrs, X_clean_t, model, k, perturb_method, feature_metadata, display
             )
+            # Stability on noisy inputs (correct operating point)
             ris, _, _ = _compute_stability(
                 _build_explainer(method, model, X_train_t),
                 X_noisy_t, model, perturb_method, feature_metadata, display
@@ -433,38 +374,52 @@ def before_after_comparison(
             print(f"  sigma={sigma:.1f} | {display:<10} | RIS={ris:.4f} | PGF={pgf:.4f}")
 
         # ── SmoothSHAP and SmoothLIME ─────────────────────────────────────────
+        # FIX Bug 3: pass X_eval (clean), not X_noisy_np
         smooth_attrs = run_smooth_explainers(
-            model, X_noisy_np, X_train, sigma=sigma, K=K, seed=seed
+            model, X_eval, X_train, sigma=sigma, K=K, seed=seed
         )
 
         smooth_scores: dict[str, dict] = {}
-        key_map = {"smooth_shap": ("shap", "smooth_shap"), "smooth_lime": ("lime", "smooth_lime")}
-        for attr_key, (vanilla_key, display) in key_map.items():
+        key_map = {
+            "smooth_shap": ("shap", "smooth_shap"),
+            "smooth_lime": ("lime", "smooth_lime"),
+        }
+        for attr_key, (vanilla_method, display) in key_map.items():
             if attr_key not in smooth_attrs:
                 smooth_scores[display] = {"RIS": float("nan"), "PGF": float("nan")}
                 continue
 
             s_attrs = torch.tensor(smooth_attrs[attr_key], dtype=torch.float32)
 
-            # For stability we need a live explainer object; use vanilla object
-            # but pass smooth attributions to faithfulness metrics
+            # FIX Bug 2: faithfulness on clean inputs
             pgf, _ = _compute_faithfulness(
-                s_attrs, X_noisy_t, model, k, perturb_method, feature_metadata, display
+                s_attrs, X_clean_t, model, k, perturb_method, feature_metadata, display
             )
 
-            # Re-build vanilla explainer as the live object for stability
-            live_exp = _build_explainer(vanilla_key, model, X_train_t)
+            # FIX Bug 1: build a real SmoothExplainer as the live object for stability
+            # so eval_relative_stability calls SmoothExplainer.get_explanations() internally
+            try:
+                smooth_live_exp = SmoothExplainer(
+                    base_method=vanilla_method,
+                    model=model,
+                    dataset_tensor=X_train_t,
+                    K=K,
+                    internal_sigma=sigma,
+                    seed=seed,
+                )
+            except Exception as exc:
+                print(f"  [WARNING] Could not build SmoothExplainer for {display}: {exc}")
+                smooth_scores[display] = {"RIS": float("nan"), "PGF": pgf}
+                continue
+
             ris, _, _ = _compute_stability(
-                live_exp, X_noisy_t, model, perturb_method, feature_metadata, display
+                smooth_live_exp, X_noisy_t, model, perturb_method, feature_metadata, display
             )
             smooth_scores[display] = {"RIS": ris, "PGF": pgf}
             print(f"  sigma={sigma:.1f} | {display:<15} | RIS={ris:.4f} | PGF={pgf:.4f}")
 
         # ── Assemble rows with delta columns ──────────────────────────────────
-        pair_map = [
-            ("shap",  "smooth_shap"),
-            ("lime",  "smooth_lime"),
-        ]
+        pair_map = [("shap", "smooth_shap"), ("lime", "smooth_lime")]
         for vanilla_key, smooth_key in pair_map:
             v = vanilla_scores.get(vanilla_key, {})
             s = smooth_scores.get(smooth_key, {})
@@ -474,35 +429,24 @@ def before_after_comparison(
             v_pgf = v.get("PGF", float("nan"))
             s_pgf = s.get("PGF", float("nan"))
 
-            # delta_RIS: improvement = vanilla_RIS - smooth_RIS (lower is better)
             delta_ris = (v_ris - s_ris) if not (np.isnan(v_ris) or np.isnan(s_ris)) else float("nan")
-            # delta_PGF: improvement = smooth_PGF - vanilla_PGF (higher is better)
             delta_pgf = (s_pgf - v_pgf) if not (np.isnan(s_pgf) or np.isnan(v_pgf)) else float("nan")
 
             for name, ris_val, pgf_val, d_ris, d_pgf in [
                 (vanilla_key, v_ris, v_pgf, 0.0, 0.0),
                 (smooth_key,  s_ris, s_pgf, delta_ris, delta_pgf),
             ]:
-                all_records.append({
-                    "sigma": sigma,
-                    "explainer": name,
-                    "RIS": ris_val,
-                    "PGF": pgf_val,
-                    "delta_RIS": d_ris,
-                    "delta_PGF": d_pgf,
-                })
-                sigma_ba_records.append({
-                    "explainer": name,
-                    "RIS": ris_val,
-                    "PGF": pgf_val,
-                    "delta_RIS": d_ris,
-                    "delta_PGF": d_pgf,
-                })
+                record = {
+                    "sigma": sigma, "explainer": name,
+                    "RIS": ris_val, "PGF": pgf_val,
+                    "delta_RIS": d_ris, "delta_PGF": d_pgf,
+                }
+                all_records.append(record)
+                sigma_ba_records.append({k: v for k, v in record.items() if k != "sigma"})
 
-        # Save per-sigma BA CSV
         if sigma_ba_records:
-            df_ba_sigma = pd.DataFrame(sigma_ba_records).set_index("explainer")
-            df_ba_sigma.to_csv(ba_sigma_csv)
+            df_ba = pd.DataFrame(sigma_ba_records).set_index("explainer")
+            df_ba.to_csv(ba_sigma_csv)
             print(f"  [save] BA CSV → {ba_sigma_csv}")
 
     if not all_records:
